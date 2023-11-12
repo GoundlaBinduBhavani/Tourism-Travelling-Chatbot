@@ -13,7 +13,7 @@ import calendar
 
 app = Flask(__name__)
 
-openai.api_key = "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"
+openai.api_key = "KEY"
 model_id = 'gpt-3.5-turbo'
 def ChatGPT_conversation(conversation):
     response = openai.ChatCompletion.create(
