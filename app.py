@@ -1,347 +1,611 @@
-from flask import Flask, render_template, request,redirect,url_for
-from playsound import playsound
+from flask import Flask, render_template, request, jsonify, send_file, make_response
+import google.generativeai as genai
 import speech_recognition as sr
-from googletrans import Translator
-from gtts import gTTS
+from dotenv import load_dotenv
 import os
-import pyttsx3
 import re
-import openai
-import pygame
-import requests
-import calendar
+import wikipediaapi
+from gtts import gTTS
+import tempfile
+import sys
+import traceback
+import pyttsx3
 
+load_dotenv()
+api_key = os.getenv("GEMINI_API_KEY")
 app = Flask(__name__)
 
-openai.api_key = "KEY"
-model_id = 'gpt-3.5-turbo'
-def ChatGPT_conversation(conversation):
-    response = openai.ChatCompletion.create(
-        model=model_id,
-        messages=conversation,
-        temperature=0,
-        max_tokens=3800
-    )
+genai.configure(api_key=api_key)
+model = genai.GenerativeModel("gemini-1.5-flash")
+recognizer = sr.Recognizer()
 
-    conversation.append({'role': response.choices[0].message.role, 'content': response.choices[0].message.content})
-    return conversation
+try:
+    engine = pyttsx3.init()
+    engine.setProperty('rate', 150)  
+    engine.setProperty('volume', 0.9)  
+except Exception as e:
+    print(f"Error initializing TTS engine: {str(e)}")
+    engine = None
 
+wiki_wiki = wikipediaapi.Wikipedia(
+    language='en',
+    user_agent='TourismChatbot/1.0 (bindubhavani113@gmail.com)'
+)
 
+def extract_trip_details(user_input):
+    budget_pattern = r"\b(\d+)\s*(lakh|lac|crore|INR|rs|rupees)?\b"
+    city_pattern = r"\b(?:to|in|visit|go to|travel to)\s+([A-Za-z]+)\b"
+    days_pattern = r"\b(\d+)\s*(?:days?|nights?)\b"
 
-# Set up Google Translate API
-translator = Translator()
+    budget_match = re.search(budget_pattern, user_input, re.IGNORECASE)
+    if budget_match:
+        budget = int(budget_match.group(1))
+        unit = budget_match.group(2).lower() if budget_match.group(2) else None
+        if unit in ["lakh", "lac"]:
+            budget *= 100000
+        elif unit == "crore":
+            budget *= 10000000
+    else:
+        budget = None
+    city_match = re.search(city_pattern, user_input, re.IGNORECASE)
+    city = city_match.group(1).strip() if city_match else None
+    days_match = re.search(days_pattern, user_input, re.IGNORECASE)
+    days = int(days_match.group(1)) if days_match else None
 
-# Set up speech recognition
-r = sr.Recognizer()
+    return {
+        "budget": budget,
+        "city": city,
+        "days": days
+    }
 
-# Set up requests session with longer timeout
-session = requests.Session()
-session.timeout = 30
+def fetch_wikipedia_data(place_name):
+    page = wiki_wiki.page(place_name)
+    if page.exists():
+        return page.summary
+    return "No information found."
 
-# Set up Google Translate API
-translator = Translator()
+def generate_tripadvisor_link(destination):
+    query = f"{destination} hotels".replace(" ", "+")
+    return f"https://www.tripadvisor.com/Search?q={query}"
 
-# Set up speech recognition
-r = sr.Recognizer()
+def generate_trip_plan(destination, days, budget):
+    wiki_summary = fetch_wikipedia_data(destination)
+    tripadvisor_url = generate_tripadvisor_link(destination)
+
+    final_prompt = f"""
+    Plan a {days}-day trip to {destination} (a city in India) with a budget of {budget} INR.
+
+    Wikipedia Summary:
+    {wiki_summary}
+
+    Requirements:
+    1. Highly Rated and Famous Places:
+       • Include only the most famous, highly rated, and most visited tourist places in {destination}.
+       • Avoid less-known or low-rated places.
+    2. Complete Daily Schedule:
+       • Provide a detailed schedule for each day, including timings, entry fees, food, shopping, transportation, and traffic tips.
+       • Ensure no place is revisited, and each day has unique places.
+    3. Evening Activities:
+       • Include unique and fun evening activities (e.g., sunset spots, night markets, cultural shows).
+    4. Meal Plans:
+       • Include specific recommendations for breakfast, lunch, and dinner for each day.
+       • Suggest local dishes and restaurants that fit within the budget.
+       • Allocate extra money for food since the user's eating habits are unknown.
+    5. Additional Recommendations:
+       • After scheduling all days, provide additional recommendations for parks, gardens, temples, caves, beaches, malls, forts, palaces, museums, etc.
+    6. Last Day:
+       • Do not allocate the last day for departure or relaxation. Include new tourist places even on the last day.
+    7. Accommodation:
+       • Suggest hotels/lodges under the allotted budget with approximate prices.
+       • Include this EXACT line at the end of the accommodation section:
+         "🔍 <a href='{tripadvisor_url}' target='_blank' style='text-decoration: none; color: #0066cc; font-weight: 600;'>Find hotels in {destination} on Tripadvisor</a>"
+       • If the next day's places are far, suggest changing accommodations accordingly.
+    8. Budget Warnings:
+       • If the budget is too low for the number of days, politely inform the user and suggest adjustments.
+    9. Add a "Travel Tips" section at the end with 3-5 practical tips for the trip.
+
+    Format (use • for all bullets, NOT *):
+    Day 1:
+    • Places to Visit:
+      1. Place 1 (Timings: 9 AM - 12 PM)
+         • Famous for: [Description]
+         • Entry Fee: [Exact price or "Don't know"]
+         • Food: [Famous dishes/snacks]
+         • Shopping: [Nearby shopping areas]
+         • Nearby Attractions: [Suggestions]
+         • Transportation: [Options]
+         • Traffic Tips: [Suggestions to avoid traffic]
+      2. Place 2 (Timings: 1 PM - 5 PM)
+         • Famous for: [Description]
+         • Entry Fee: [Exact price or "Don't know"]
+         • Food: [Famous dishes/snacks]
+         • Shopping: [Nearby shopping areas]
+         • Nearby Attractions: [Suggestions]
+         • Transportation: [Options]
+         • Traffic Tips: [Suggestions to avoid traffic]
+    • Evening Activity:
+      • [Description of evening activity, e.g., sunset spot, night market, cultural show]
+    • Meal Plans:
+      • Breakfast: [Recommendation]
+      • Lunch: [Recommendation]
+      • Dinner: [Recommendation]
+    • Unique Experience:
+      • [Description of a unique or offbeat experience]
+    • Local Festival or Event:
+      • [Description of a local festival or event, if applicable]
+    • Hidden Gem:
+      • [Description of a hidden gem]
+    • Cultural Insight:
+      • [Cultural insight related to the destination]
+    • Interactive Element:
+      • [Interactive question or poll to tailor the itinerary]
+    Travel Tips:
+    • Tip 1: [Practical advice, e.g., "Carry cash for beach shacks"]
+    • Tip 2: [Safety/cultural tip, e.g., "Dress modestly in temples"]
+    • Tip 3: [Transport tip, e.g., "Rent a scooter for flexibility"]
+
+    Repeat this structure for all {days} days, ensuring no place is revisited and each day has unique activities.
+    """
+
+    response = model.generate_content(final_prompt)
+    plan_text = response.text.strip()
+    return plan_text
+
+@app.route('/')
+def index():
+    return render_template('interface.html')
 
 @app.route('/chatbot')
 def chatbot():
     return render_template('chatbot.html')
 
-def openaicall(prompt):
-        conversation=[]
-        conversation.append({'role': 'user', 'content': prompt})
-        conversation = ChatGPT_conversation(conversation)
-        response=conversation[-1]['content'].strip()
-        return response
+@app.route('/voicebot')
+def voicebot():
+    return render_template('speech.html')
 
-@app.route('/process', methods=['POST'])
-def process():
-    def source_text(source_lang,to_lang):
-        # Listen to user's speech input
-        while 1:
-            with sr.Microphone() as source:
-                print("Speak now:")
-                audio = r.listen(source)
+@app.route('/chat', methods=['POST'])
+def chat():
+    try:
+        user_input = request.json.get("message", "").strip()
+        is_speech = request.json.get("is_speech", False)
+        step = request.json.get("step", "ask_destination")
+        destination = request.json.get("destination", "")
+        days = request.json.get("days", 0)
+        budget = request.json.get("budget", 0)
 
-            # Convert speech to text
+        print(f"Current step: {step}, Destination: {destination}, Days: {days}, Budget: {budget}")
+        print(f"User input: {user_input}")
+
+        if step == "ask_destination":
+            return jsonify({
+                "message": f"How many days do you plan to spend in {user_input}?",
+                "step": "ask_days",
+                "destination": user_input
+            })
+
+        if step == "ask_days":
             try:
-                user_input = r.recognize_google(audio, language=source_lang)
-                print("You said: ", user_input)
-                return user_input
-            except sr.UnknownValueError:
-                print("Sorry, could not understand your speech")
-            except sr.RequestError as e:
-                print("Could not request results from Google Speech Recognition service; {0}".format(e))
+                days = int(user_input)
+                if days <= 0 or days > 30:
+                    return jsonify({
+                        "message": "Please provide a valid number of days between 1 and 30.",
+                        "step": "ask_days",
+                        "destination": destination,
+                        "days": 0,
+                        "budget": 0
+                    })
+            except ValueError:
+                return jsonify({
+                    "message": "Please enter a valid number of days (e.g., '3 days' or 'three days').",
+                    "step": "ask_days",
+                    "destination": destination,
+                    "days": 0,
+                    "budget": 0
+                })
 
-    source_lang = request.form['source_lang']
-    to_lang = 'english'
-    # invoking Translator
-    user_input = source_text(source_lang,to_lang)
-    translator = Translator()
+            return jsonify({
+                "message": "What is your budget? (Enter a number in INR)",
+                "step": "ask_budget",
+                "destination": destination,
+                "days": days
+            })
 
-    # Translating from src to dest
-    text_to_translate = translator.translate(user_input, dest=to_lang)
-    text = text_to_translate.text
-    print(text)
-    prompt0=text+"is that statement belong to tourism or travel domain. if it is not belonging to that domain say  \
-    'no' only without any description. otherwise give 'yes'"
-    response=openaicall(prompt0)
-    neg=['no','not',"don't","can't","cannot","nope"]
-    f=0
-    for i in neg:
-        if i in response:
-            f=1
-    if f==1:
-        response="I am an AI chatbot.Ask about travel plan!"            
-    else:
-    # Translate response text to user's language
-        translated_response = translator.translate(response, dest=source_lang)
-        # Print translated response
-        response_text = translated_response.text
+        if step == "ask_budget":
+            try:
+                budget = int(user_input)
+                if budget <= 0:
+                    return jsonify({
+                        "message": "Please provide a valid budget amount greater than zero.",
+                        "step": "ask_budget",
+                        "destination": destination,
+                        "days": days,
+                        "budget": 0
+                    })
 
-        # Generate speech from response text
-        speak = gTTS(text=response_text, lang=source_lang, slow=False)
-        # Save speech to file
-        speak.save("captured_voice.mp3")
-            # Send user input to OpenAI API    
-        prompt = "act like a tourism chatbot and answer" +text+"summarize the output"
-        response=openaicall(prompt)
+                if budget < days * 2000:
+                    return jsonify({
+                        "message": f"Your budget of {budget} INR for {days} days is quite low. It may be difficult to cover all expenses (accommodation, food, transportation, and entry fees). Would you like to adjust your budget or reduce the number of days?",
+                        "step": "ask_budget"
+                    })
 
-        print(response)        
+                trip_plan = generate_trip_plan(destination, days, budget)
+                return jsonify({
+                    "message": trip_plan,
+                    "step": "trip_complete",
+                    "destination": destination,
+                    "days": days,
+                    "budget": budget
+                })
+            except ValueError:
+                return jsonify({
+                    "message": "Please enter a valid budget amount (e.g., '5000 INR' or 'five thousand rupees').",
+                    "step": "ask_budget",
+                    "destination": destination,
+                    "days": days,
+                    "budget": 0
+                })
 
-# Translate response text to user's language
-    translated_response = translator.translate(response, dest=source_lang)
-            # Print translated response
-    response_text = translated_response.text
+        if step == "trip_complete" and user_input.lower() in ["ok", "thank you", "thanks"]:
+            return jsonify({
+                "message": "You're welcome! Would you like to plan another trip? (Yes/No)",
+                "step": "ask_another_trip"
+            })
 
-            # Generate speech from response text
-    speak = gTTS(text=response_text, lang=source_lang, slow=False)
-            # Save speech to file
-    speak.save("captured_voice.mp3")            
-    return render_template('speech.html', response_text=response_text)
-            
-
-@app.route('/play_audio', methods=['POST'])
-def play_audio():
-    # Initialize pygame mixer
-    pygame.mixer.init()
-
-    # Load sound file
-    pygame.mixer.music.load('captured_voice.mp3')
-
-    # Play sound file
-    pygame.mixer.music.play()
-
-    # Wait for sound to finish playing
-    while pygame.mixer.music.get_busy():
-        continue
-
-    # Clean up pygame mixer
-    pygame.mixer.quit()
-
-    # Delete sound file
-    os.remove('captured_voice.mp3')
-
-    return render_template('speech.html')
-
-@app.route("/")
-def index():
-    return render_template("interface.html")
-
-@app.route('/speech')
-def speech():
-    return render_template('speech.html')
-
-# define a route for the button that triggers the redirect
-@app.route('/redirect')
-def redirect_page():
-    return redirect(url_for('speech'))
-
-@app.route("/get")
-def get_bot_response():
-    months_abbr = list(calendar.month_abbr)[1:]
-    months_full = list(calendar.month_name)[1:]
-    all_months=months_full +[month.lower() for month in months_full]+months_abbr+[month.upper() for month in months_abbr]+[month.lower() for month in months_abbr]
-    requirements=['type of trip','cuisine','budget','language','age','no of days']
-    global responses
-
-    if 'responses' not in globals():
-        responses = []  # initialize the list of responses
-
-    user_input = request.args.get("msg")
-    responses.append(user_input)
-    print(responses)
-    if len(responses) == 1:
-        global response
-        response=""
-        prompt=responses[0]+ "if the above text is a demographic location or real place return True" 
-        conversation=[]
-        conversation.append({'role': 'user', 'content': prompt})
-        conversation = ChatGPT_conversation(conversation)
-        response=conversation[-1]['content'].strip()
-        neg1=['no','not','sorry','nope','cannot',"can't"]
-        for i in neg1:
-            if i in response.lower():
-                responses.pop()
-                return "Enter a valid place"
+        if step == "ask_another_trip":
+            if user_input.lower() in ["yes", "y"]:
+                return jsonify({
+                    "message": "Great! Which city are you planning to visit?",
+                    "step": "ask_destination",
+                    "destination": "",
+                    "days": 0,
+                    "budget": 0
+                })
+            elif user_input.lower() in ["no", "n"]:
+                return jsonify({
+                    "message": "Thank you for using the tourism chatbot. Have a great day!",
+                    "step": "end_conversation"
+                })
             else:
-                return "In Which month do you want to visit?"
-    
-    elif len(responses)==2:
-        if responses[1] in all_months:
-            return "Requirements:\n1.Type of Trip\n2.Cusine\n3.Budget\n4.Language\n5.Age\n6.No Of Days\nEnter number of requirements according to your preference."
-        else:
-            responses.pop()
-            return "Enter a valid month"
-        #return "Requirements:\n1.Type of Trip\n2.Cusine\n3.Budget\n4.Language\n5.Age\n6.No Of Days\nEnter number of requirements according to your preference."
-    elif len(responses)==3 :
-        if int(responses[2])>0 and int(responses[2])<7:
-            global c
-            global p_clist_req
-            global p_list_add_nreq
-            p_list_add_nreq=""
-            p_clist_req=""
-            global p_vlist_req
-            p_vlist_req=""
-            global c_add
-            c_add=0
-            global add_nreq
-            add_nreq=0
-            global nreq
-            global cnreq
-            global list_req
-            global vlist_req
-            vlist_req=[]
-            list_req=[]
-            global list_add_nreq
-            list_add_nreq=[]
-            nreq=int(user_input)
-            print(nreq)
-            cnreq=nreq
-            c=nreq
-            print(c)
-            return "enter your requirement:"
-        else:
-            responses.pop()
-            return "Enter a number between 1 and 6"
+                return jsonify({
+                    "message": "Please respond with 'Yes' or 'No'.",
+                    "step": "ask_another_trip"
+                })
 
-    elif c>1:
-        list_req.append(user_input)
-        print(list_req)
-        c-=1
-        return "enter your requirement:"
+        return jsonify({"message": "I couldn't understand. Please try again."})
     
-    elif len(responses)==3+cnreq:
-        list_req.append(user_input)
-        print(list_req)
-        global clist_req
-        clist_req=list_req.copy()
-        for i in range(len(clist_req)):
-            clist_req[i]=clist_req[i].lower()
-        e=list_req.pop(0)
-        return "Enter "+e
+    except Exception as e:
+        print(f"Error in chat endpoint: {str(e)}", file=sys.stderr)
+        traceback.print_exc()
+        return jsonify({
+            "message": "Sorry, I encountered an error processing your request. Please try again.",
+            "step": "ask_destination",
+            "destination": "",
+            "days": 0,
+            "budget": 0
+        }), 500
 
-    elif len(list_req)>0:
-        vlist_req.append(user_input)
-        e=list_req.pop(0)
-        return "Enter "+e
-    
-    elif len(responses)==3+(2*cnreq):
-        if (len(list_req))==0:
-            vlist_req.append(user_input)
-        return "Do you want to add any additional requirements(y/n)?"
-    
-    elif len(responses)==3+(2*cnreq)+1:
-        global choice
-        choice=user_input
-        if user_input.lower()=="y":
-            return "Enter No Of Additional Reqirements You Want To Add:"
-        if user_input.lower()=="n":
-            print(add_nreq)
-            return "do you want us to help with schedule a trip or best places to visit based on your requirements?\n(enter schedule trip/best places)"
+@app.route('/voice', methods=['POST'])
+def voice():
+    try:
+        data = request.json
+        user_input = data.get("message", "").strip()
+        is_speech = data.get("is_speech", False)
+        step = data.get("step", "ask_destination")
+        destination = data.get("destination", "")
+        days = data.get("days", 0)
+        budget = data.get("budget", 0)
 
-    elif len(responses)==3+(2*cnreq)+2 and choice.lower()=='y':  
-        add_nreq=int(user_input)
-        print(add_nreq)
-        c_add=add_nreq
-        return "enter your requirement:"
-    
-    elif c_add>1:
-        list_add_nreq.append(user_input)
-        c_add-=1
-        return "enter your requirement:"
-    
-    elif len(responses)==3+(2*cnreq)+2+add_nreq and choice.lower()=='y' :
-        list_add_nreq.append(user_input)
-        return "do you want us to help with schedule a trip or best places to visit based on your requirements?\n(enter schedule trip/best places)"
-    
-    elif (len(responses)==3+(2*cnreq)+2+add_nreq and user_input.lower()=="schedule trip")or (len(responses)==3+(2*cnreq)+2+add_nreq+1 and user_input.lower()=="schedule trip"):
-        if "No Of Days".lower() not in clist_req:
-            #print(clist_req)
-            return "enter No Of Days:"
-        else:
-           
-            for i in range(len(clist_req)):
-                p_clist_req+=clist_req[i]+','
-                p_vlist_req+=vlist_req[i]+","
+        print(f"Current step: {step}, Destination: {destination}, Days: {days}, Budget: {budget}")
+        print(f"User input: {user_input}")
 
-            for j in range(len(list_add_nreq)):
-                p_list_add_nreq+=list_add_nreq[j]+","
+        if step == "ask_destination" and not user_input:
+            return jsonify({
+                "message": "Which city in India are you planning to visit?",
+                "step": "ask_destination",
+                "destination": "",
+                "days": 0,
+                "budget": 0
+            })
+
+        if step == "ask_destination":
+            if not user_input:
+                return jsonify({
+                    "message": "Please tell me which city you want to visit.",
+                    "step": "ask_destination",
+                    "destination": "",
+                    "days": 0,
+                    "budget": 0
+                })
             
-            prompt = "i would like to visit " + responses[0] +" in the month "+responses[1]+ "give a schedule trip for"
-            +vlist_req[clist_req.index("no of days")]+"days"+"which includes"+p_clist_req[:-1]+"as"
-            +p_vlist_req[:-1]+"and also include additional requirments like"+p_list_add_nreq[:-1]+
-            "and aslo tell in which hotel to stay based on the above requirement which is include in the schedule of trip"
-        response = openaicall(prompt)
-        return response+"\n\n\n Are You Satisfied With The Response? say yes/no"
-    
-    elif (len(responses)==3+(2*cnreq)+2+add_nreq and user_input.lower()=="best places") :
-        print(responses)
-        prompt = "give response as if you are a tourist chatbot for this statement, i would like to visit " + 
-        responses[0] +" in the month "+responses[1]+ "give the best places to visit."
-        response = openaicall(prompt)
-        return response+"\n\n\n Are You Satisfied With The Response? say absolutely/never"
-    
-    elif (len(responses)==3+(2*cnreq)+2+add_nreq+1 and user_input.lower()=="best places")or(len(responses)==3+(2*cnreq)+2+add_nreq and user_input.lower()=="best places") :
-        #print(responses)
-        prompt = "i would like to visit " + responses[0] +" in the month "+responses[1]+ "give the best places to visit."
-        response = openaicall(prompt)
-        return response+"\n\n\n Are You Satisfied With The Response? say absolutely/never"
+            destination = ' '.join([word.capitalize() for word in user_input.split()])
+            if len(destination) < 2:
+                return jsonify({
+                    "message": "Please provide a valid city name.",
+                    "step": "ask_destination",
+                    "destination": "",
+                    "days": 0,
+                    "budget": 0
+                })
+            
+            return jsonify({
+                "message": f"How many days do you plan to spend in {destination}? (e.g., 'three days' or '3 days')",
+                "step": "ask_days",
+                "destination": destination,
+                "days": 0,
+                "budget": 0
+            })
 
-    elif (len(responses)==3+(2*cnreq)+2+add_nreq+1 and user_input.isdigit()):
-        clist_req.append("no of days")
-        vlist_req.append(user_input)
-        prompt = "i would like to visit " + responses[0] +" in the month "+responses[1]+ "give a schedule trip for"+vlist_req[clist_req.index("no of days")]+"days"+"which includes"+p_clist_req[:-1]+"as"+p_vlist_req[:-1]+"and also include additional requirments like"+p_list_add_nreq[:-1]+"and aslo tell in which hotel to stay based on the above requirement which is include in the schedule of trip"
-        response = openaicall(prompt)
-        return response+"\n\n\n Are You Satisfied With The Response? say yes/no"
-   
-    elif (len(responses)==3+(2*cnreq)+2+add_nreq+2 and user_input.isdigit()):
-        clist_req.append("no of days")
-        vlist_req.append(user_input)
-        prompt = "i would like to visit " + responses[0] +" in the month "+responses[1]+ "give a schedule trip for"+vlist_req[clist_req.index("no of days")]+"days"+"which includes"+p_clist_req[:-1]+"as"+p_vlist_req[:-1]+"and also include additional requirments like"+p_list_add_nreq[:-1]+"and aslo tell in which hotel to stay based on the above requirement which is include in the schedule of trip"
-        response = openaicall(prompt)
-        return response+"\n\n\n Are You Satisfied With The Response? say yeah/nope"
-    elif user_input.lower()=="yes" or user_input.lower()=="yeah" or user_input.lower()=="absolutely":
-        responses=[]
-        return "Thank you for using our chatbot,visit again"
-    
-    elif user_input.lower()=="never":
-        prompt = "i would like to visit " + responses[0] +" in the month "+responses[1]+ "give the best places to visit."
-        response = openaicall(prompt)
+        if step == "ask_days":
+            try:
+                days_match = re.search(r'(\d+)', user_input.replace(',', ''))
+                if days_match:
+                    days = int(days_match.group(1))
+                else:
+                    number_words = {
+                        'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+                        'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+                        'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14,
+                        'fifteen': 15, 'twenty': 20, 'thirty': 30, 'forty': 40,
+                        'fifty': 50, 'hundred': 100
+                    }
+                    lower_input = user_input.lower()
+                    for word, num in number_words.items():
+                        if word in lower_input:
+                            days = num
+                            break
+                    else:
+                        raise ValueError("No valid number found")
+                
+                if days <= 0 or days > 30:
+                    return jsonify({
+                        "message": "Please provide a valid number of days between 1 and 30.",
+                        "step": "ask_days",
+                        "destination": destination,
+                        "days": 0,
+                        "budget": 0
+                    })
+                
+                return jsonify({
+                    "message": f"What's your total budget for this {days}-day trip to {destination}? (Please say the amount in INR)",
+                    "step": "ask_budget",
+                    "destination": destination,
+                    "days": days,
+                    "budget": 0
+                })
+            except (ValueError, AttributeError):
+                return jsonify({
+                    "message": "Please tell me a valid number of days for your trip (e.g., 'three days' or '3 days').",
+                    "step": "ask_days",
+                    "destination": destination,
+                    "days": 0,
+                    "budget": 0
+                })
+
+        if step == "ask_budget":
+            try:
+                budget_text = user_input.lower()
+                budget = 0
+                
+                if 'thousand' in budget_text:
+                    num_match = re.search(r'(\d+\.?\d*)', budget_text.replace(',', ''))
+                    if num_match:
+                        budget = float(num_match.group(1)) * 1000
+                elif 'lakh' in budget_text or 'lac' in budget_text:
+                    num_match = re.search(r'(\d+\.?\d*)', budget_text.replace(',', ''))
+                    if num_match:
+                        budget = float(num_match.group(1)) * 100000
+                elif 'crore' in budget_text:
+                    num_match = re.search(r'(\d+\.?\d*)', budget_text.replace(',', ''))
+                    if num_match:
+                        budget = float(num_match.group(1)) * 10000000
+                else:
+                    num_match = re.search(r'(\d+\.?\d*)', budget_text.replace(',', ''))
+                    if num_match:
+                        budget = float(num_match.group(1))
+                
+                budget = int(budget)
+                
+                if budget <= 0:
+                    return jsonify({
+                        "message": "Please provide a valid budget amount greater than zero.",
+                        "step": "ask_budget",
+                        "destination": destination,
+                        "days": days,
+                        "budget": 0
+                    })
+                
+                min_budget = days * 1000
+                if budget < min_budget:
+                    return jsonify({
+                        "message": f"Your budget of {budget} INR for {days} days might be too low for a comfortable trip. We recommend at least {min_budget} INR. Would you like to increase your budget? (Yes/No)",
+                        "step": "confirm_low_budget",
+                        "destination": destination,
+                        "days": days,
+                        "budget": budget
+                    })
+                
+                trip_plan = generate_trip_plan(destination, days, budget)
+                return jsonify({
+                    "message": trip_plan,
+                    "step": "trip_complete",
+                    "destination": destination,
+                    "days": days,
+                    "budget": budget
+                })
+            except (ValueError, AttributeError):
+                return jsonify({
+                    "message": "Please tell me a valid budget amount for your trip (e.g., '5000 INR' or 'five thousand rupees').",
+                    "step": "ask_budget",
+                    "destination": destination,
+                    "days": days,
+                    "budget": 0
+                })
+
+        if step == "confirm_low_budget":
+            if user_input.lower() in ["yes", "y"]:
+                return jsonify({
+                    "message": "Please provide your new budget amount:",
+                    "step": "ask_budget",
+                    "destination": destination,
+                    "days": days,
+                    "budget": 0
+                })
+            else:
+                trip_plan = generate_trip_plan(destination, days, budget)
+                return jsonify({
+                    "message": trip_plan,
+                    "step": "trip_complete",
+                    "destination": destination,
+                    "days": days,
+                    "budget": budget
+                })
+
+        if step == "trip_complete":
+            return jsonify({
+                "message": "Would you like to plan another trip? (Yes/No)",
+                "step": "ask_another_trip",
+                "destination": destination,
+                "days": days,
+                "budget": budget
+            })
+
+        if step == "ask_another_trip":
+            if user_input.lower() in ["yes", "y"]:
+                return jsonify({
+                    "message": "Great! Which city are you planning to visit?",
+                    "step": "ask_destination",
+                    "destination": "",
+                    "days": 0,
+                    "budget": 0
+                })
+            else:
+                return jsonify({
+                    "message": "Thank you for using the tourism chatbot. Have a great day!",
+                    "step": "end_conversation",
+                    "destination": "",
+                    "days": 0,
+                    "budget": 0
+                })
+
+        return jsonify({
+            "message": "I didn't understand that. Could you please repeat?",
+            "step": step,
+            "destination": destination,
+            "days": days,
+            "budget": budget
+        })
+
+    except Exception as e:
+        print(f"Error in voice endpoint: {str(e)}")
+        return jsonify({
+            "message": "Sorry, I encountered an error. Please try again.",
+            "step": "ask_destination",
+            "destination": "",
+            "days": 0,
+            "budget": 0
+        }), 500
+
+def speech_to_text(max_retries=3):
+    """Improved speech recognition with retries and better error handling"""
+    for attempt in range(max_retries):
+        try:
+            with sr.Microphone() as source:
+                print(f"Attempt {attempt + 1}: Speak now...")
+                recognizer.adjust_for_ambient_noise(source, duration=1)
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=5)
+                text = recognizer.recognize_google(audio, language="en-US")
+                if text:
+                    print(f"Recognized: {text}")
+                    return text
+        except sr.WaitTimeoutError:
+            print("Listening timed out while waiting for speech")
+            if attempt == max_retries - 1:
+                return "I didn't hear anything. Please try again."
+        except sr.UnknownValueError:
+            print("Google Speech Recognition could not understand audio")
+            if attempt == max_retries - 1:
+                return "Sorry, I couldn't understand your speech."
+        except sr.RequestError as e:
+            print(f"Could not request results from Google Speech Recognition service; {e}")
+            if attempt == max_retries - 1:
+                return "Speech service is unavailable. Please try typing instead."
+        except Exception as e:
+            print(f"Unexpected error in speech recognition: {str(e)}")
+            if attempt == max_retries - 1:
+                return "Sorry, there was an error processing your speech."
+
+    return "Sorry, I couldn't understand your speech after several attempts. Please try typing your response."
+
+@app.route('/play_audio', methods=['GET'])
+def play_audio():
+    try:
+        text = request.args.get('text', '')
         
-        return response+"\n\n\n Are You Satisfied With The Response? say absolutely/never"
-    elif user_input.lower()=="no":
-        prompt = "i would like to visit " + responses[0] +" in the month "+responses[1]+ "give a schedule trip for"+vlist_req[clist_req.index("no of days")]+"days"+"which includes"+p_clist_req[:-1]+"as"+p_vlist_req[:-1]+"and also include additional requirments like"+p_list_add_nreq[:-1]+"and aslo tell in which hotel to stay based on the above requirement which is include in the schedule of trip"
-        response = openaicall(prompt)
-        return response+"\n\n\n Are You Satisfied With The Response? say yes/no"
-    elif user_input.lower()=="nope":
-        prompt = "i would like to visit " + responses[0] +" in the month "+responses[1]+ "give a schedule trip for"+vlist_req[clist_req.index("no of days")]+"days"+"which includes"+p_clist_req[:-1]+"as"+p_vlist_req[:-1]+"and also include additional requirments like"+p_list_add_nreq[:-1]+"and aslo tell in which hotel to stay based on the above requirement which is include in the schedule of trip"
-        response = openaicall(prompt)
-
-        return response+"\n\n\n Are You Satisfied With The Response? say yeah/nope"
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+        
+        clean_text = re.sub(r'<[^>]*>', '', text)
+        clean_text = re.sub(r'•', '-', clean_text)
+        max_chunk_length = 200
+        text_chunks = [clean_text[i:i+max_chunk_length] 
+                      for i in range(0, len(clean_text), max_chunk_length)]
+  
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp_file:
+            try:
+                for chunk in text_chunks:
+                    tts = gTTS(text=chunk, lang='en', slow=False)
+                    tts.write_to_fp(tmp_file)
+                
+                tmp_file.close()
+                with open(tmp_file.name, 'rb') as f:
+                    audio_data = f.read()
+                os.unlink(tmp_file.name)
+                
+                response = make_response(audio_data)
+                response.headers['Content-Type'] = 'audio/mpeg'
+                response.headers['Content-Disposition'] = 'inline; filename=itinerary.mp3'
+                return response
+                
+            except Exception as e:
+                print(f"gTTS error: {str(e)}")
+                if os.path.exists(tmp_file.name):
+                    os.unlink(tmp_file.name)
+                return jsonify({"error": "Failed to generate speech"}), 500
             
-    return response+"\n\n\n Are You Satisfied With The Response? say yes/no"
+    except Exception as e:
+        print(f"Error in play_audio: {str(e)}")
+        return jsonify({"error": f"Error generating audio: {str(e)}"}), 500
 
-if __name__ =="__main__" :
+@app.route('/play_audio_pyttsx3', methods=['POST'])
+def play_audio_pyttsx3():
+    try:
+        data = request.json
+        text = data.get("text", "")
+        
+        temp_engine = pyttsx3.init()
+        temp_engine.say(text)
+        temp_engine.runAndWait()
+        
+        return jsonify({
+            "message": "Audio played successfully."
+        })
+    except Exception as e:
+        print(f"Error in play_audio_pyttsx3: {str(e)}")
+        return jsonify({
+            "message": f"Error playing audio: {str(e)}"
+        }), 500
+
+@app.route('/slides')
+def slides():
+    return render_template('slides.html')
+
+@app.route('/aboutus')
+def aboutus():
+    return render_template('aboutus.html')
+
+@app.route('/contactus')
+def contactus():
+    return render_template('contactus.html')
+
+if __name__ == '__main__':
     app.run(debug=True)
