@@ -1,7 +1,5 @@
 # TripGenius - AI-Powered Travel Itinerary Planner
 
-![TripGenius Banner](https://via.placeholder.com/1200x400?text=TripGenius+Banner)
-
 TripGenius is an intelligent tourism planning web application that generates personalized travel itineraries using Google's Gemini AI. Users interact via voice or text to receive detailed daily plans with attractions, activities, and budget-aware recommendations.
 
 ## Key Features
@@ -70,19 +68,3 @@ TripGenius is an intelligent tourism planning web application that generates per
 
     python app.py
     Access at: http://localhost:5000
-
-5. Project Structure
-
-    TripGenius/
-    ├── static/                # Static assets
-    │   ├── css/               # Custom styles
-    │   ├── img/               # All images
-    │   └── js/                # JavaScript files
-    ├── templates/             # Jinja2 templates
-    │   ├── core/              # Base templates
-    │   ├── features/          # Feature pages
-    │   └── partials/          # UI components
-    ├── app.py                 # Flask application
-    ├── config.py              # Configuration
-    ├── requirements.txt       # Dependencies
-    └── README.md              # Documentation
